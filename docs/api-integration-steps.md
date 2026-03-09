@@ -1,72 +1,66 @@
-# API Integration Steps - Encrypted Attachment Triage
+# Sandbox HTTP Actions Integration Guide (Logic Apps Consumption)
 
-## 1) Deploy Logic App (Consumption)
+This guide documents the HTTP action pattern for Recorded Future and MetaDefender integrations.
 
-Deploy `workflows/soc-email-malware-triage.logicapp.json` as a Consumption workflow.
+## 1) Workflow file
 
-## 2) Authentication and access model
+- `workflows/sandbox-http-actions.logicapp.json`
 
-Use Logic App **system-assigned Managed Identity** for HTTP APIs:
+## 2) Required capabilities covered
 
-- Defender Quarantine API (`https://api.security.microsoft.com`)
-- Sentinel Incident API (`https://management.azure.com/`)
-- Log Analytics Logs Ingestion (`https://monitor.azure.com/`)
-- Sandbox API and decryption API (when MI trust is supported)
+For **both** systems:
 
-> Note: Exchange Online "When new email arrives" in Consumption uses Office 365 connector auth; scope that connector identity to `cyber@abc.com`.
+- Submit file via HTTP `POST`
+- Parse submit response and extract scan identifier
+- Poll analysis result via HTTP `GET` in an `Until` loop
+- Parse poll response
+- Normalize verdict to one of:
+  - `clean`
+  - `malicious`
+  - `suspicious`
+  - `failed`
 
-## 3) Trigger and filter configuration
+## 3) Authentication model
 
-- Trigger: Office 365 `When a new email arrives`.
-- Mailbox target: `cyber@abc.com`.
-- Subject filter: `[WARNING: MESSAGE ENCRYPTED]`.
+Configured with `ManagedServiceIdentity` where possible:
 
-## 4) Core processing sequence
+- Recorded Future audience: `https://api.recordedfuture.com`
+- MetaDefender audience: `https://api.metadefender.com`
 
-1. Parse password from body via regex: `Password[:= ]\s*(\S+)`.
-2. Parse Message-ID header for correlation.
-3. Query Defender quarantine by Message-ID.
-4. Download quarantined attachments.
-5. For each attachment:
-   - decrypt via decryption API with extracted password
-   - submit decrypted payload to sandbox API
-   - capture scan ID
-   - poll status every 30 seconds
-   - stop after 3 minutes
-   - retry one additional polling cycle if no verdict
-6. Aggregate attachment verdicts.
+If a provider tenant/app does not support MI token trust, replace with approved enterprise auth method using secure parameters.
 
-## 5) Decision logic
+## 4) Retry policy
 
-- If **any** attachment verdict is `malicious`:
-  - create Sentinel incident via Incident API.
-- If **all** attachment verdicts are `clean`:
-  - release message from quarantine via Defender API.
-- If verdict is `suspicious` or scan failed/time-out:
-  - send SOC notification email for manual investigation.
+- Submit calls: exponential retry (`count: 4`, `interval: 10s`, max `1m`)
+- Poll calls: fixed retry (`count: 2`, `interval: 10s`)
 
-## 6) Polling settings
+## 5) Polling logic
 
-- Interval: `30` seconds
-- Max duration per cycle: `3` minutes
-- Retries if no verdict: `1` full additional polling cycle
+- `Until` loop for each provider
+- Wait step: 30 seconds
+- Loop timeout: 3 minutes
+- Loop count: 6
 
-## 7) Logging to Log Analytics
+## 6) Response parsing and verdict mapping
 
-Use Logs Ingestion API custom stream/table and write structured records with:
+### Recorded Future normalization
 
-- `Sender`
-- `Recipient`
-- `AttachmentName`
-- `SandboxVerdict`
-- `Timestamp`
-- `ActionTaken`
+- `malicious` when verdict malicious OR high risk score threshold
+- `clean` when verdict clean/benign
+- `suspicious` when verdict suspicious or still in progress at timeout
+- otherwise `failed`
 
-Include tracking identifiers and result metadata for correlation.
+### MetaDefender normalization
 
-## 8) Error handling
+- `malicious` when detected AV count > 0
+- `clean` when result indicates no threats detected
+- `suspicious` when suspicious indicator or incomplete progress
+- otherwise `failed`
 
-- Per-action retry policies for outbound HTTP actions.
-- Global failure scope:
-  - notify SOC,
-  - terminate run with explicit failure code.
+## 7) Output contract
+
+Workflow returns:
+
+- `recordedFutureVerdict`
+- `metaDefenderVerdict`
+- normalized enum list

@@ -1,0 +1,261 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2019-05-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "recordedFutureBaseUrl": { "type": "String", "defaultValue": "https://api.recordedfuture.com" },
+    "metaDefenderBaseUrl": { "type": "String", "defaultValue": "https://api.metadefender.com/v4" },
+    "pollIntervalSeconds": { "type": "Int", "defaultValue": 30 },
+    "pollCountLimit": { "type": "Int", "defaultValue": 6 },
+    "fileName": { "type": "String" },
+    "fileContentBase64": { "type": "String" },
+    "password": { "type": "String", "defaultValue": "" }
+  },
+  "triggers": {
+    "Manual": {
+      "type": "Request",
+      "kind": "Http",
+      "inputs": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "fileName": { "type": "string" },
+            "fileContentBase64": { "type": "string" },
+            "password": { "type": "string" }
+          },
+          "required": [ "fileName", "fileContentBase64" ]
+        }
+      }
+    }
+  },
+  "actions": {
+    "Initialize_Variables": {
+      "type": "Scope",
+      "actions": {
+        "Initialize_RF_Verdict": {
+          "type": "InitializeVariable",
+          "inputs": { "variables": [ { "name": "rfVerdictNormalized", "type": "string", "value": "failed" } ] }
+        },
+        "Initialize_MD_Verdict": {
+          "type": "InitializeVariable",
+          "runAfter": { "Initialize_RF_Verdict": [ "Succeeded" ] },
+          "inputs": { "variables": [ { "name": "mdVerdictNormalized", "type": "string", "value": "failed" } ] }
+        }
+      }
+    },
+
+    "Submit_RecordedFuture": {
+      "type": "Http",
+      "runAfter": { "Initialize_Variables": [ "Succeeded" ] },
+      "inputs": {
+        "method": "POST",
+        "uri": "@{concat(parameters('recordedFutureBaseUrl'), '/v2/sandbox/analysis')}",
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+          "fileName": "@{coalesce(triggerBody()?['fileName'], parameters('fileName'))}",
+          "fileContentBase64": "@{coalesce(triggerBody()?['fileContentBase64'], parameters('fileContentBase64'))}",
+          "archivePassword": "@{coalesce(triggerBody()?['password'], parameters('password'))}"
+        },
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://api.recordedfuture.com"
+        },
+        "retryPolicy": {
+          "type": "exponential",
+          "count": 4,
+          "interval": "PT10S",
+          "maximumInterval": "PT1M"
+        }
+      }
+    },
+    "Parse_RecordedFuture_Submit": {
+      "type": "ParseJson",
+      "runAfter": { "Submit_RecordedFuture": [ "Succeeded" ] },
+      "inputs": {
+        "content": "@body('Submit_RecordedFuture')",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "scanId": { "type": [ "string", "null" ] },
+            "id": { "type": [ "string", "null" ] },
+            "status": { "type": [ "string", "null" ] }
+          }
+        }
+      }
+    },
+    "Until_RecordedFuture_Complete": {
+      "type": "Until",
+      "runAfter": { "Parse_RecordedFuture_Submit": [ "Succeeded" ] },
+      "expression": "@equals(body('Parse_RecordedFuture_Poll')?['status'], 'completed')",
+      "limit": {
+        "count": "@{parameters('pollCountLimit')}",
+        "timeout": "PT3M"
+      },
+      "actions": {
+        "Get_RecordedFuture_Status": {
+          "type": "Http",
+          "inputs": {
+            "method": "GET",
+            "uri": "@{concat(parameters('recordedFutureBaseUrl'), '/v2/sandbox/analysis/', coalesce(body('Parse_RecordedFuture_Submit')?['scanId'], body('Parse_RecordedFuture_Submit')?['id']))}",
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "https://api.recordedfuture.com"
+            },
+            "retryPolicy": {
+              "type": "fixed",
+              "count": 2,
+              "interval": "PT10S"
+            }
+          }
+        },
+        "Parse_RecordedFuture_Poll": {
+          "type": "ParseJson",
+          "runAfter": { "Get_RecordedFuture_Status": [ "Succeeded" ] },
+          "inputs": {
+            "content": "@body('Get_RecordedFuture_Status')",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": { "type": [ "string", "null" ] },
+                "verdict": { "type": [ "string", "null" ] },
+                "riskScore": { "type": [ "number", "null" ] }
+              }
+            }
+          }
+        },
+        "Wait_30s_RF": {
+          "type": "Wait",
+          "runAfter": { "Parse_RecordedFuture_Poll": [ "Succeeded" ] },
+          "inputs": { "interval": { "count": "@{parameters('pollIntervalSeconds')}", "unit": "Second" } }
+        }
+      }
+    },
+    "Normalize_RecordedFuture_Verdict": {
+      "type": "SetVariable",
+      "runAfter": { "Until_RecordedFuture_Complete": [ "Succeeded", "TimedOut" ] },
+      "inputs": {
+        "name": "rfVerdictNormalized",
+        "value": "@{if(or(equals(toLower(coalesce(body('Parse_RecordedFuture_Poll')?['verdict'], '')), 'malicious'), greaterOrEquals(coalesce(body('Parse_RecordedFuture_Poll')?['riskScore'], 0), 80)), 'malicious', if(or(equals(toLower(coalesce(body('Parse_RecordedFuture_Poll')?['verdict'], '')), 'clean'), equals(toLower(coalesce(body('Parse_RecordedFuture_Poll')?['verdict'], '')), 'benign')), 'clean', if(or(equals(toLower(coalesce(body('Parse_RecordedFuture_Poll')?['verdict'], '')), 'suspicious'), equals(toLower(coalesce(body('Parse_RecordedFuture_Poll')?['status'], '')), 'in_progress')), 'suspicious', 'failed')))}"
+      }
+    },
+
+    "Submit_MetaDefender": {
+      "type": "Http",
+      "runAfter": { "Normalize_RecordedFuture_Verdict": [ "Succeeded" ] },
+      "inputs": {
+        "method": "POST",
+        "uri": "@{concat(parameters('metaDefenderBaseUrl'), '/file')}",
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+          "file_name": "@{coalesce(triggerBody()?['fileName'], parameters('fileName'))}",
+          "file_data": "@{coalesce(triggerBody()?['fileContentBase64'], parameters('fileContentBase64'))}",
+          "archive_password": "@{coalesce(triggerBody()?['password'], parameters('password'))}"
+        },
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://api.metadefender.com"
+        },
+        "retryPolicy": {
+          "type": "exponential",
+          "count": 4,
+          "interval": "PT10S",
+          "maximumInterval": "PT1M"
+        }
+      }
+    },
+    "Parse_MetaDefender_Submit": {
+      "type": "ParseJson",
+      "runAfter": { "Submit_MetaDefender": [ "Succeeded" ] },
+      "inputs": {
+        "content": "@body('Submit_MetaDefender')",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "data_id": { "type": [ "string", "null" ] }
+          }
+        }
+      }
+    },
+    "Until_MetaDefender_Complete": {
+      "type": "Until",
+      "runAfter": { "Parse_MetaDefender_Submit": [ "Succeeded" ] },
+      "expression": "@equals(body('Parse_MetaDefender_Poll')?['scan_results']?['progress_percentage'], 100)",
+      "limit": {
+        "count": "@{parameters('pollCountLimit')}",
+        "timeout": "PT3M"
+      },
+      "actions": {
+        "Get_MetaDefender_Status": {
+          "type": "Http",
+          "inputs": {
+            "method": "GET",
+            "uri": "@{concat(parameters('metaDefenderBaseUrl'), '/file/', body('Parse_MetaDefender_Submit')?['data_id'])}",
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "https://api.metadefender.com"
+            },
+            "retryPolicy": {
+              "type": "fixed",
+              "count": 2,
+              "interval": "PT10S"
+            }
+          }
+        },
+        "Parse_MetaDefender_Poll": {
+          "type": "ParseJson",
+          "runAfter": { "Get_MetaDefender_Status": [ "Succeeded" ] },
+          "inputs": {
+            "content": "@body('Get_MetaDefender_Status')",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "scan_results": {
+                  "type": "object",
+                  "properties": {
+                    "progress_percentage": { "type": [ "integer", "number", "null" ] },
+                    "total_detected_avs": { "type": [ "integer", "number", "null" ] },
+                    "scan_all_result_a": { "type": [ "string", "null" ] }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "Wait_30s_MD": {
+          "type": "Wait",
+          "runAfter": { "Parse_MetaDefender_Poll": [ "Succeeded" ] },
+          "inputs": { "interval": { "count": "@{parameters('pollIntervalSeconds')}", "unit": "Second" } }
+        }
+      }
+    },
+    "Normalize_MetaDefender_Verdict": {
+      "type": "SetVariable",
+      "runAfter": { "Until_MetaDefender_Complete": [ "Succeeded", "TimedOut" ] },
+      "inputs": {
+        "name": "mdVerdictNormalized",
+        "value": "@{if(greater(coalesce(body('Parse_MetaDefender_Poll')?['scan_results']?['total_detected_avs'], 0), 0), 'malicious', if(equals(toLower(coalesce(body('Parse_MetaDefender_Poll')?['scan_results']?['scan_all_result_a'], '')), 'no threats detected'), 'clean', if(or(equals(toLower(coalesce(body('Parse_MetaDefender_Poll')?['scan_results']?['scan_all_result_a'], '')), 'suspicious'), less(coalesce(body('Parse_MetaDefender_Poll')?['scan_results']?['progress_percentage'], 0), 100)), 'suspicious', 'failed')))}"
+      }
+    },
+
+    "Compose_Output": {
+      "type": "Compose",
+      "runAfter": {
+        "Normalize_RecordedFuture_Verdict": [ "Succeeded" ],
+        "Normalize_MetaDefender_Verdict": [ "Succeeded" ]
+      },
+      "inputs": {
+        "recordedFutureVerdict": "@{variables('rfVerdictNormalized')}",
+        "metaDefenderVerdict": "@{variables('mdVerdictNormalized')}",
+        "normalizedVerdictSet": [ "clean", "malicious", "suspicious", "failed" ]
+      }
+    },
+    "Response": {
+      "type": "Response",
+      "runAfter": { "Compose_Output": [ "Succeeded" ] },
+      "inputs": {
+        "statusCode": 200,
+        "body": "@outputs('Compose_Output')"
+      }
+    }
+  },
+  "outputs": {}
+}

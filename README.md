@@ -1,34 +1,33 @@
-# Azure Logic Apps (Consumption) - Encrypted Attachment Malware Automation
+# Azure Logic Apps (Consumption) - Sandbox HTTP Integrations for SOC Automation
 
-This repo contains a production SOC automation workflow for password-protected email attachments quarantined by Exchange Online/Defender.
+This repository contains production-style Azure Logic App (Consumption) definitions for sandbox integration patterns used in email malware automation.
 
-## Workflow included
+## Workflow artifact
 
-- `workflows/soc-email-malware-triage.logicapp.json`
-  - Trigger: Exchange Online **When new email arrives** for `cyber@abc.com`.
-  - Filter: subject contains `[WARNING: MESSAGE ENCRYPTED]`.
-  - Extract password using regex `Password[:= ]\s*(\S+)`.
-  - Extract Message-ID and locate original quarantined message in Defender.
-  - Download quarantined attachments.
-  - For each attachment:
-    - decrypt with provided password (decryption API)
-    - submit to sandbox API
-    - poll every 30 seconds up to 3 minutes
-    - retry polling cycle once when verdict is not completed
-  - Decision:
-    - any malicious => create Sentinel incident
-    - all clean => release email from quarantine
-    - suspicious/scan failure => notify SOC
-  - Logging to Log Analytics with structured fields:
-    - sender
-    - recipient
-    - attachment name
-    - sandbox verdict
-    - timestamp
-    - action taken
+- `workflows/sandbox-http-actions.logicapp.json`
+  - Uses **HTTP actions** for:
+    - Recorded Future sandbox
+      - submit file
+      - parse submit response for scan ID
+      - poll result using `Until`
+      - parse poll response
+      - normalize verdict to: `clean | malicious | suspicious | failed`
+    - MetaDefender sandbox
+      - submit file
+      - parse submit response for `data_id`
+      - poll result using `Until`
+      - parse poll response
+      - normalize verdict to: `clean | malicious | suspicious | failed`
+  - Uses **Managed Identity** auth audiences where possible.
+  - Applies retry policies on outbound HTTP calls.
+  - Returns normalized verdicts in a final HTTP response.
 
-## Security and resiliency
+## Standard polling configuration
 
-- Managed Identity for Defender, Sentinel API, Log Analytics ingestion, and internal APIs where supported.
-- Retry policies applied on outbound HTTP calls.
-- Global failure handler notifies SOC and terminates with explicit failure code.
+- Poll interval: 30 seconds
+- Max duration: 3 minutes
+- Polling implemented with `Until` limits (`count` + `timeout`)
+
+## Notes
+
+- Validate target API MI support in your tenant; if third-party APIs do not support Entra-issued tokens, swap auth method via secure configuration.
