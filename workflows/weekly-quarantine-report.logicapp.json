@@ -1,0 +1,60 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2019-05-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "logAnalyticsWorkspaceId": { "type": "String" },
+    "logsApiVersion": { "type": "String", "defaultValue": "2023-09-01" },
+    "logsBaseUrl": { "type": "String", "defaultValue": "https://api.loganalytics.io" },
+    "socNotificationWebhook": { "type": "String" }
+  },
+  "triggers": {
+    "Weekly_Recurrence": {
+      "type": "Recurrence",
+      "recurrence": {
+        "frequency": "Week",
+        "interval": 1,
+        "schedule": {
+          "weekDays": [ "Monday" ],
+          "hours": [ 6 ],
+          "minutes": [ 0 ]
+        },
+        "timeZone": "UTC"
+      }
+    }
+  },
+  "actions": {
+    "Query_weekly_metrics": {
+      "type": "Http",
+      "inputs": {
+        "method": "POST",
+        "uri": "@{concat(parameters('logsBaseUrl'), '/v1/workspaces/', parameters('logAnalyticsWorkspaceId'), '/query')}",
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+          "query": "SocQuarantineAttachmentTriage_CL | where TimeGenerated > ago(7d) | summarize EmailsProcessed=dcount(MessageId), Malicious=countif(tobool(AnyMalicious)==true), Released=countif(tobool(AnyMalicious)==false and tobool(AnyFailedOrSuspicious)==false), SuspiciousOrFailed=countif(tobool(AnyFailedOrSuspicious)==true), TopSenders=make_set(Sender, 10), TopRecipients=make_set(Recipient, 10), AttachmentTypes=make_set(AttachmentTypes, 10)"
+        },
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://api.loganalytics.io"
+        },
+        "retryPolicy": { "type": "exponential", "count": 4, "interval": "PT10S" }
+      }
+    },
+    "Notify_SOC_weekly_report": {
+      "type": "Http",
+      "runAfter": { "Query_weekly_metrics": [ "Succeeded" ] },
+      "inputs": {
+        "method": "POST",
+        "uri": "@{parameters('socNotificationWebhook')}",
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+          "severity": "Informational",
+          "category": "WeeklySOCMetrics",
+          "window": "Last 7 days",
+          "metrics": "@{body('Query_weekly_metrics')?['tables'][0]?['rows'][0]}"
+        },
+        "retryPolicy": { "type": "fixed", "count": 2, "interval": "PT15S" }
+      }
+    }
+  },
+  "outputs": {}
+}
